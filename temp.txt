@@ -1,0 +1,1 @@
+python train.py --epochs 10 --lr 5e-5 --base_channels 24 --n_dpgrnn 3 --tra_bands 4 --supp_over_weight 1.0 --supp_under_weight 8.0 --supp_weight 0.5 --wav_l1_weight 0.30 --speech_loudness_weight 0.15 --out_dir checkpoints_v5_loudness --hop_length 256 --n_fft 512 --segment_seconds 4.0 --init_checkpoint checkpoints_v4_extreme/best_model.pt

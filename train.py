@@ -169,7 +169,7 @@ class MixedPairDataset(Dataset):
     underlying file list is fixed and small."""
 
     def __init__(self, data_root, csv_rows, sample_rate=16000,
-                 segment_seconds=4.0, clean_target_rms=0.1, seed=0):
+                 segment_seconds=4.0, clean_target_rms=0.1, seed=0, random_crop=True):
         self.mixed_dir = Path(data_root) / "mixed_dataset"
         self.clean_dir = Path(data_root) / "clean"
         self.rows = csv_rows
@@ -177,6 +177,7 @@ class MixedPairDataset(Dataset):
         self.segment_len = int(segment_seconds * sample_rate)
         self.clean_target_rms = clean_target_rms
         self.rng = np.random.default_rng(seed)
+        self.random_crop = random_crop
         # cache decoded audio in memory -- the same clean file (e.g.
         # "Clean clip1.wav") is reused across many mixed_dataset rows
         self._cache = {}
@@ -208,7 +209,14 @@ class MixedPairDataset(Dataset):
         length = min(mixed.shape[-1], clean.shape[-1])
         mixed, clean = mixed[..., :length], clean[..., :length]
 
-        return random_crop_pair_or_loop(mixed, clean, self.segment_len, self.rng)
+        if self.random_crop:
+            return random_crop_pair_or_loop(mixed, clean, self.segment_len, self.rng)
+
+        # Deterministic center crop for validation/held-out evaluation.
+        if length < self.segment_len:
+            return random_crop_pair_or_loop(mixed, clean, self.segment_len, np.random.default_rng(0))
+        start = max(0, (length - self.segment_len) // 2)
+        return mixed[start:start + self.segment_len], clean[start:start + self.segment_len]
 
 
 # --------------------------------------------------------------------------
@@ -291,10 +299,35 @@ def si_snr_loss(pred_wav, clean_wav, eps=1e-8):
 
 def wav_l1_loss(pred_wav, clean_wav):
     """Plain (NOT scale-invariant) L1 loss on the waveform. Unlike si_snr_loss,
-    this directly penalizes a globally-scaled-down prediction, closing the
-    "free under-suppression" loophole described above. Keep the weight on
-    this small (~0.1-0.2) -- it's a corrective nudge, not the main driver."""
+    this directly penalizes a globally-scaled-down prediction and therefore helps
+    keep the enhanced speech at the clean target's overall amplitude."""
     return F.l1_loss(pred_wav, clean_wav)
+
+
+def speech_gain_loss(pred_wav, clean_wav, eps=1e-8, under_weight=2.0, over_weight=0.5):
+    """Match the amplitude of the speech component to the clean reference.
+
+    Uses the projection coefficient of the enhanced waveform onto clean speech.
+    This makes the loss largely insensitive to unrelated residual gunfire/noise:
+    alpha ~= 1.0 means the speech component is at the clean reference level.
+
+    The loss is asymmetric: being quieter than clean is penalized more strongly
+    than being louder, because the current goal is to restore quiet speech while
+    keeping the already-good gunfire suppression.
+    """
+    pred = pred_wav - pred_wav.mean(dim=-1, keepdim=True)
+    clean = clean_wav - clean_wav.mean(dim=-1, keepdim=True)
+
+    clean_energy = torch.sum(clean ** 2, dim=-1, keepdim=True).clamp_min(eps)
+    alpha = torch.sum(pred * clean, dim=-1, keepdim=True) / clean_energy
+
+    # Avoid pathological gradients from extremely small or large projection gains.
+    alpha = torch.clamp(alpha, 0.05, 3.0)
+
+    under = torch.clamp(1.0 - alpha, min=0.0)
+    over = torch.clamp(alpha - 1.0, min=0.0)
+
+    return (under_weight * under.pow(2) + over_weight * over.pow(2)).mean()
 
 
 def suppression_penalty(pred_spec, clean_spec, under_weight=2.5, over_weight=1.0):
@@ -319,10 +352,17 @@ def suppression_penalty(pred_spec, clean_spec, under_weight=2.5, over_weight=1.0
 # --------------------------------------------------------------------------
 def run_epoch(model, loader, stft, optimizer, device, train=True,
               spec_weight=1.0, wav_weight=1.0,
-              wav_l1_weight=0.15,
-              supp_weight=0.4, supp_under_weight=2.5, supp_over_weight=1.0):
+              wav_l1_weight=0.30, speech_gain_weight=0.35,
+              supp_weight=0.5, supp_under_weight=8.0, supp_over_weight=1.0):
     model.train(mode=train)
-    totals = {"total": 0.0, "spec": 0.0, "si_snr": 0.0, "wav_l1": 0.0, "supp": 0.0}
+    totals = {
+        "total": 0.0,
+        "spec": 0.0,
+        "si_snr": 0.0,
+        "wav_l1": 0.0,
+        "speech_gain": 0.0,
+        "supp": 0.0,
+    }
     n_batches = 0
 
     for noisy_wav, clean_wav in loader:
@@ -339,6 +379,7 @@ def run_epoch(model, loader, stft, optimizer, device, train=True,
             loss_spec = compressed_spectral_loss(pred_spec, clean_spec)
             loss_si_snr = si_snr_loss(pred_wav, clean_wav)
             loss_wav_l1 = wav_l1_loss(pred_wav, clean_wav)
+            loss_speech_gain = speech_gain_loss(pred_wav, clean_wav)
             loss_supp = suppression_penalty(pred_spec, clean_spec,
                                              under_weight=supp_under_weight,
                                              over_weight=supp_over_weight)
@@ -346,6 +387,7 @@ def run_epoch(model, loader, stft, optimizer, device, train=True,
             loss = (spec_weight * loss_spec
                     + wav_weight * loss_si_snr
                     + wav_l1_weight * loss_wav_l1
+                    + speech_gain_weight * loss_speech_gain
                     + supp_weight * loss_supp)
 
             if train:
@@ -358,6 +400,7 @@ def run_epoch(model, loader, stft, optimizer, device, train=True,
         totals["spec"] += loss_spec.item()
         totals["si_snr"] += loss_si_snr.item()
         totals["wav_l1"] += loss_wav_l1.item()
+        totals["speech_gain"] += loss_speech_gain.item()
         totals["supp"] += loss_supp.item()
         n_batches += 1
 
@@ -393,13 +436,15 @@ def main():
     p.add_argument("--spec_weight", type=float, default=1.0)
     p.add_argument("--wav_weight", type=float, default=1.0,
                    help="weight on the scale-invariant SI-SNR loss")
-    p.add_argument("--wav_l1_weight", type=float, default=0.15,
+    p.add_argument("--wav_l1_weight", type=float, default=0.30,
                    help="EARLY-PHASE (epochs 1..schedule_epoch-1) weight on plain "
-                        "(non-scale-invariant) waveform L1 loss -- counteracts SI-SNR's "
-                        "blind spot for uniform under-suppression")
-    p.add_argument("--supp_weight", type=float, default=0.4,
+                        "(non-scale-invariant) waveform L1 loss -- helps preserve the "
+                        "clean target amplitude")
+    p.add_argument("--speech_gain_weight", type=float, default=0.35,
+                   help="weight on speech amplitude/gain matching to the clean reference")
+    p.add_argument("--supp_weight", type=float, default=0.5,
                    help="EARLY-PHASE weight on the asymmetric over-suppression penalty")
-    p.add_argument("--supp_under_weight", type=float, default=2.5,
+    p.add_argument("--supp_under_weight", type=float, default=8.0,
                    help="EARLY-PHASE cost per unit of speech energy removed that shouldn't "
                         "have been (raise this if the model still over-suppresses speech)")
     p.add_argument("--supp_over_weight", type=float, default=1.0,
@@ -467,9 +512,11 @@ def main():
     train_ds = MixedPairDataset(args.data_root, train_rows, args.sample_rate,
                                  args.segment_seconds, args.clean_target_rms, seed=args.seed)
     val_ds = MixedPairDataset(args.data_root, val_rows, args.sample_rate,
-                               args.segment_seconds, args.clean_target_rms, seed=args.seed + 1000)
+                               args.segment_seconds, args.clean_target_rms, seed=args.seed + 1000,
+                               random_crop=False)
     extreme_ds = MixedPairDataset(args.data_root, extreme_rows, args.sample_rate,
-                                   args.segment_seconds, args.clean_target_rms, seed=args.seed + 2000)
+                                   args.segment_seconds, args.clean_target_rms, seed=args.seed + 2000,
+                                   random_crop=False)
 
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, drop_last=True)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, drop_last=False)
@@ -503,9 +550,15 @@ def main():
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=4)
 
     # Early-phase loss weights: what every epoch uses until (and if) schedule_epoch hits.
-    early_kwargs = dict(spec_weight=args.spec_weight, wav_weight=args.wav_weight,
-                         wav_l1_weight=args.wav_l1_weight, supp_weight=args.supp_weight,
-                         supp_under_weight=args.supp_under_weight, supp_over_weight=args.supp_over_weight)
+    early_kwargs = dict(
+        spec_weight=args.spec_weight,
+        wav_weight=args.wav_weight,
+        wav_l1_weight=args.wav_l1_weight,
+        speech_gain_weight=args.speech_gain_weight,
+        supp_weight=args.supp_weight,
+        supp_under_weight=args.supp_under_weight,
+        supp_over_weight=args.supp_over_weight,
+    )
 
     # Late-phase loss weights: any *_late arg left unset falls back to its early value,
     # so passing only some of the _late flags is fine.
@@ -513,6 +566,7 @@ def main():
         spec_weight=args.spec_weight,      # not scheduled -- same both phases
         wav_weight=args.wav_weight,        # not scheduled -- same both phases
         wav_l1_weight=args.wav_l1_weight_late if args.wav_l1_weight_late is not None else args.wav_l1_weight,
+        speech_gain_weight=args.speech_gain_weight,  # constant by design
         supp_weight=args.supp_weight_late if args.supp_weight_late is not None else args.supp_weight,
         supp_under_weight=args.supp_under_weight_late if args.supp_under_weight_late is not None else args.supp_under_weight,
         supp_over_weight=args.supp_over_weight_late if args.supp_over_weight_late is not None else args.supp_over_weight,
@@ -545,9 +599,11 @@ def main():
         print(f"epoch {epoch:03d}/{args.epochs} | train_loss {train_stats['total']:.4f} "
               f"| val_loss {val_stats['total']:.4f} | lr {current_lr:.2e} | "
               f"val breakdown: spec {val_stats['spec']:.4f} si_snr {val_stats['si_snr']:.4f} "
-              f"wav_l1 {val_stats['wav_l1']:.4f} supp {val_stats['supp']:.4f}")
+              f"wav_l1 {val_stats['wav_l1']:.4f} speech_gain {val_stats['speech_gain']:.4f} "
+              f"supp {val_stats['supp']:.4f}")
         history.append((epoch, train_stats["total"], val_stats["total"], current_lr,
-                         val_stats["spec"], val_stats["si_snr"], val_stats["wav_l1"], val_stats["supp"]))
+                         val_stats["spec"], val_stats["si_snr"], val_stats["wav_l1"],
+                         val_stats["speech_gain"], val_stats["supp"]))
 
         if val_stats["total"] < best_val:
             best_val = val_stats["total"]
@@ -573,7 +629,7 @@ def main():
                out_dir / "last_model.pt")
 
     with open(out_dir / "history.csv", "w") as f:
-        f.write("epoch,train_loss,val_loss,lr,val_spec,val_si_snr,val_wav_l1,val_supp\n")
+        f.write("epoch,train_loss,val_loss,lr,val_spec,val_si_snr,val_wav_l1,val_speech_gain,val_supp\n")
         for row in history:
             f.write(",".join(str(x) for x in row) + "\n")
 
