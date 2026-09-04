@@ -67,14 +67,31 @@ dataset really is at sample_data/ and you're happy with the defaults:
 
 LOSS-WEIGHT SCHEDULE (optional)
 --------------------------------
---wav_l1_weight / --supp_weight / --supp_under_weight / --supp_over_weight
-set the EARLY-phase values used from epoch 1. Each has a *_late twin
-(e.g. --supp_under_weight_late) that only takes effect once --schedule_epoch
-is reached, letting the model first learn general enhancement with gentler
-weights before the loss is pushed harder toward "never remove speech, even
-if noise leaks through" for the back half of training. Omit --schedule_epoch
-to just use the early values for the whole run (the old, unscheduled
-behaviour).
+--wav_l1_weight / --speech_gain_weight / --speech_gain_under_weight /
+--speech_gain_over_weight / --supp_weight / --supp_under_weight /
+--supp_over_weight set the EARLY-phase values used from epoch 1. Each has a
+*_late twin (e.g. --supp_under_weight_late) that only takes effect once
+--schedule_epoch is reached, letting the model first learn general
+enhancement with gentler weights before the loss is pushed harder toward
+"never remove speech, even if noise leaks through" for the back half of
+training. Any *_late flag left unset falls back to its early-phase value, so
+passing only some of them is fine. Omit --schedule_epoch entirely to just use
+the early values for the whole run (the old, unscheduled behaviour).
+
+LOCALIZED QUIET-SPEECH FIX (speech_gain_loss is now WINDOWED)
+--------------------------------------------------------------------------
+speech_gain_loss used to compute one amplitude-match score for the ENTIRE
+--segment_seconds clip. That's an average: a segment correct for 3.5s but at
+30% amplitude for the last 0.5s scored almost the same as a fully-correct
+segment, because the good stretch hid the bad one in the average -- verified
+empirically (0.015 vs 0.98 for the same 0.5s undershoot, whole-segment vs
+localized). That's exactly "gunfire suppression is good, but voice stayed
+quiet specifically where input speech was already quiet under heavy
+gunfire" -- the old loss never actually penalized that stretch on its own.
+It's now computed over --speech_gain_window_sec windows (default 0.5s),
+weighted by each window's own clean-reference speech energy, so a locally-
+quiet stretch is scored -- and penalized -- on its own merits regardless of
+how good the rest of the same clip is.
 """
 import argparse
 import csv
@@ -326,30 +343,61 @@ def wav_l1_loss(pred_wav, clean_wav):
     return F.l1_loss(pred_wav, clean_wav)
 
 
-def speech_gain_loss(pred_wav, clean_wav, eps=1e-8, under_weight=2.0, over_weight=0.5):
-    """Match the amplitude of the speech component to the clean reference.
+def speech_gain_loss(pred_wav, clean_wav, sample_rate, eps=1e-8,
+                      under_weight=2.0, over_weight=0.5, window_sec=0.5):
+    """Match the amplitude of the speech component to the clean reference,
+    computed over SHORT WINDOWS (window_sec) rather than the whole utterance.
 
-    Uses the projection coefficient of the enhanced waveform onto clean speech.
-    This makes the loss largely insensitive to unrelated residual gunfire/noise:
-    alpha ~= 1.0 means the speech component is at the clean reference level.
+    WHY WINDOWED, NOT WHOLE-UTTERANCE (this used to be a single alpha per
+    ~4s segment): that's a per-utterance AVERAGE. If a segment has an easy,
+    gunfire-free stretch where the model restores amplitude fine, AND a
+    hard, gunfire-heavy stretch where it doesn't, a good average alpha can
+    completely hide a bad local one -- the easy stretch's correct amplitude
+    balances out the hard stretch's undershoot in the correlation sum.
+    Empirically: a prediction that's dead-on for 3.5s of a 4s segment but
+    at 30% amplitude for the last 0.5s scored a loss of 0.015 under the old
+    formulation -- barely distinguishable from correct -- versus 0.98 when
+    that same 30%-amplitude undershoot covered the whole segment. That's
+    exactly the reported symptom: gunfire suppression is good, but voice
+    stayed quiet specifically in the stretches where input speech itself
+    was quiet under heavy gunfire, because the utterance-level average
+    never actually penalized that stretch on its own.
 
-    The loss is asymmetric: being quieter than clean is penalized more strongly
-    than being louder, because the current goal is to restore quiet speech while
-    keeping the already-good gunfire suppression.
+    Windows are weighted by their OWN clean-reference energy before
+    averaging, so windows with real speech in the ground truth pull the
+    loss regardless of how much noise sits on top of them in the input,
+    while near-silent windows (a natural pause, nothing to restore)
+    contribute little -- their alpha estimate would otherwise be noisy/
+    meaningless (dividing by ~0 energy) and could inject spurious gradient.
+
+    Falls back to a single whole-segment window if the input is shorter
+    than window_sec (e.g. --segment_seconds < --speech_gain_window_sec).
+
+    under_weight/over_weight: as before, being quieter than clean is
+    penalized more than being louder, because the goal is restoring quiet
+    speech while keeping suppression.
     """
-    pred = pred_wav - pred_wav.mean(dim=-1, keepdim=True)
-    clean = clean_wav - clean_wav.mean(dim=-1, keepdim=True)
+    B, T = pred_wav.shape
+    win = max(1, min(int(window_sec * sample_rate), T))
+    n_win = T // win
 
-    clean_energy = torch.sum(clean ** 2, dim=-1, keepdim=True).clamp_min(eps)
-    alpha = torch.sum(pred * clean, dim=-1, keepdim=True) / clean_energy
+    pred = pred_wav[:, :n_win * win].reshape(B, n_win, win)
+    clean = clean_wav[:, :n_win * win].reshape(B, n_win, win)
+    pred = pred - pred.mean(dim=-1, keepdim=True)
+    clean = clean - clean.mean(dim=-1, keepdim=True)
 
-    # Avoid pathological gradients from extremely small or large projection gains.
+    clean_energy = torch.sum(clean ** 2, dim=-1)                        # (B, n_win)
+    alpha = torch.sum(pred * clean, dim=-1) / clean_energy.clamp_min(eps)
     alpha = torch.clamp(alpha, 0.05, 3.0)
 
     under = torch.clamp(1.0 - alpha, min=0.0)
     over = torch.clamp(alpha - 1.0, min=0.0)
+    per_window_loss = under_weight * under.pow(2) + over_weight * over.pow(2)  # (B, n_win)
 
-    return (under_weight * under.pow(2) + over_weight * over.pow(2)).mean()
+    # per-utterance weights summing to 1, proportional to how much real
+    # speech energy (per the CLEAN reference) each window actually has
+    weight = clean_energy / clean_energy.sum(dim=-1, keepdim=True).clamp_min(eps)
+    return (weight * per_window_loss).sum(dim=-1).mean()
 
 
 def suppression_penalty(pred_spec, clean_spec, under_weight=2.5, over_weight=1.0):
@@ -372,10 +420,11 @@ def suppression_penalty(pred_spec, clean_spec, under_weight=2.5, over_weight=1.0
 # --------------------------------------------------------------------------
 # 6. Train / validate for one epoch
 # --------------------------------------------------------------------------
-def run_epoch(model, loader, stft, optimizer, device, train=True,
+def run_epoch(model, loader, stft, optimizer, device, sample_rate, train=True,
               spec_weight=1.0, wav_weight=1.0,
               wav_l1_weight=0.30, speech_gain_weight=0.35,
               speech_gain_under_weight=2.0, speech_gain_over_weight=0.5,
+              speech_gain_window_sec=0.5,
               supp_weight=0.5, supp_under_weight=8.0, supp_over_weight=1.0):
     model.train(mode=train)
     totals = {
@@ -402,9 +451,10 @@ def run_epoch(model, loader, stft, optimizer, device, train=True,
             loss_spec = compressed_spectral_loss(pred_spec, clean_spec)
             loss_si_snr = si_snr_loss(pred_wav, clean_wav)
             loss_wav_l1 = wav_l1_loss(pred_wav, clean_wav)
-            loss_speech_gain = speech_gain_loss(pred_wav, clean_wav,
+            loss_speech_gain = speech_gain_loss(pred_wav, clean_wav, sample_rate=sample_rate,
                                                  under_weight=speech_gain_under_weight,
-                                                 over_weight=speech_gain_over_weight)
+                                                 over_weight=speech_gain_over_weight,
+                                                 window_sec=speech_gain_window_sec)
             loss_supp = suppression_penalty(pred_spec, clean_spec,
                                              under_weight=supp_under_weight,
                                              over_weight=supp_over_weight)
@@ -471,17 +521,36 @@ def main():
                         "(non-scale-invariant) waveform L1 loss -- helps preserve the "
                         "clean target amplitude")
     p.add_argument("--speech_gain_weight", type=float, default=0.35,
-                   help="weight on speech amplitude/gain matching to the clean reference")
+                   help="EARLY-PHASE weight on speech amplitude/gain matching to the clean "
+                        "reference (see speech_gain_loss). Now scored over short windows "
+                        "(--speech_gain_window_sec) rather than the whole segment -- see that "
+                        "flag's help for why that matters.")
     p.add_argument("--speech_gain_under_weight", type=float, default=2.0,
-                   help="inside speech_gain_loss: cost per unit of speech amplitude shortfall "
-                        "(alpha < 1, i.e. enhanced speech quieter than clean target). This is "
-                        "the most targeted knob for 'gunfire suppression is good but speech got "
-                        "quiet' -- raise it (e.g. 3-5) to push specifically on restoring ducked "
-                        "speech without touching how hard gunfire itself gets suppressed. Not "
-                        "scheduled by *_late (constant by design, same as speech_gain_weight).")
+                   help="EARLY-PHASE cost per unit of speech amplitude shortfall inside "
+                        "speech_gain_loss (alpha < 1 in a given window, i.e. enhanced speech "
+                        "quieter than clean target THERE). This is the most targeted knob for "
+                        "'gunfire suppression is good but speech got quiet' -- raise it (e.g. "
+                        "3-5) to push specifically on restoring ducked speech without touching "
+                        "how hard gunfire itself gets suppressed.")
     p.add_argument("--speech_gain_over_weight", type=float, default=0.5,
-                   help="inside speech_gain_loss: cost per unit of speech amplitude overshoot "
-                        "(alpha > 1, enhanced speech louder than clean target). Usually leave low.")
+                   help="EARLY-PHASE cost per unit of speech amplitude overshoot inside "
+                        "speech_gain_loss (alpha > 1 in a given window). Usually leave low.")
+    p.add_argument("--speech_gain_window_sec", type=float, default=0.5,
+                   help="speech_gain_loss computes its amplitude-match score (alpha) over "
+                        "windows of this length, weighted by how much clean-reference speech "
+                        "energy each window has, INSTEAD OF one alpha for the whole "
+                        "--segment_seconds clip. Why: a single whole-segment alpha is an "
+                        "average -- a segment that's correct for 3.5s but at 30%% amplitude "
+                        "for the remaining 0.5s scores almost the same as a fully-correct "
+                        "segment, because the good stretch hides the bad one in the average. "
+                        "That's exactly the 'gunfire suppressed well, but voice stayed quiet "
+                        "specifically where input speech was already quiet under heavy "
+                        "gunfire' symptom -- the old loss never actually penalized that "
+                        "stretch on its own. Smaller windows localize the penalty more "
+                        "tightly (more precise, noisier alpha estimate per window); larger "
+                        "windows are more stable but blur together nearby good/bad stretches "
+                        "again. Not scheduled by *_late -- window size doesn't need to change "
+                        "over training.")
     p.add_argument("--supp_weight", type=float, default=0.5,
                    help="EARLY-PHASE weight on the asymmetric over-suppression penalty")
     p.add_argument("--supp_under_weight", type=float, default=8.0,
@@ -493,6 +562,18 @@ def main():
     p.add_argument("--wav_l1_weight_late", type=float, default=None,
                    help="LATE-PHASE (epochs >= schedule_epoch) value for --wav_l1_weight. "
                         "Defaults to the same value as --wav_l1_weight (no schedule).")
+    p.add_argument("--speech_gain_weight_late", type=float, default=None,
+                   help="LATE-PHASE value for --speech_gain_weight. Defaults to "
+                        "--speech_gain_weight (no schedule) if not given.")
+    p.add_argument("--speech_gain_under_weight_late", type=float, default=None,
+                   help="LATE-PHASE value for --speech_gain_under_weight. Defaults to "
+                        "--speech_gain_under_weight (no schedule) if not given. Consider "
+                        "raising this alongside --supp_under_weight_late so the pressure to "
+                        "restore quiet speech keeps pace as suppression hardens in the back "
+                        "half of training.")
+    p.add_argument("--speech_gain_over_weight_late", type=float, default=None,
+                   help="LATE-PHASE value for --speech_gain_over_weight. Defaults to "
+                        "--speech_gain_over_weight (no schedule) if not given.")
     p.add_argument("--supp_weight_late", type=float, default=None,
                    help="LATE-PHASE value for --supp_weight. Defaults to --supp_weight "
                         "(no schedule) if not given.")
@@ -597,6 +678,7 @@ def main():
         speech_gain_weight=args.speech_gain_weight,
         speech_gain_under_weight=args.speech_gain_under_weight,
         speech_gain_over_weight=args.speech_gain_over_weight,
+        speech_gain_window_sec=args.speech_gain_window_sec,
         supp_weight=args.supp_weight,
         supp_under_weight=args.supp_under_weight,
         supp_over_weight=args.supp_over_weight,
@@ -608,9 +690,10 @@ def main():
         spec_weight=args.spec_weight,      # not scheduled -- same both phases
         wav_weight=args.wav_weight,        # not scheduled -- same both phases
         wav_l1_weight=args.wav_l1_weight_late if args.wav_l1_weight_late is not None else args.wav_l1_weight,
-        speech_gain_weight=args.speech_gain_weight,  # constant by design
-        speech_gain_under_weight=args.speech_gain_under_weight,  # constant by design
-        speech_gain_over_weight=args.speech_gain_over_weight,    # constant by design
+        speech_gain_weight=args.speech_gain_weight_late if args.speech_gain_weight_late is not None else args.speech_gain_weight,
+        speech_gain_under_weight=args.speech_gain_under_weight_late if args.speech_gain_under_weight_late is not None else args.speech_gain_under_weight,
+        speech_gain_over_weight=args.speech_gain_over_weight_late if args.speech_gain_over_weight_late is not None else args.speech_gain_over_weight,
+        speech_gain_window_sec=args.speech_gain_window_sec,  # not scheduled -- window size is fixed
         supp_weight=args.supp_weight_late if args.supp_weight_late is not None else args.supp_weight,
         supp_under_weight=args.supp_under_weight_late if args.supp_under_weight_late is not None else args.supp_under_weight,
         supp_over_weight=args.supp_over_weight_late if args.supp_over_weight_late is not None else args.supp_over_weight,
@@ -635,8 +718,8 @@ def main():
         if use_late and epoch == args.schedule_epoch:
             print(f"  -> epoch {epoch}: switching to late-phase loss weights {late_kwargs}")
 
-        train_stats = run_epoch(model, train_loader, stft, optimizer, device, train=True, **loss_kwargs)
-        val_stats = run_epoch(model, val_loader, stft, optimizer, device, train=False, **loss_kwargs)
+        train_stats = run_epoch(model, train_loader, stft, optimizer, device, args.sample_rate, train=True, **loss_kwargs)
+        val_stats = run_epoch(model, val_loader, stft, optimizer, device, args.sample_rate, train=False, **loss_kwargs)
         scheduler.step(val_stats["total"])
 
         current_lr = optimizer.param_groups[0]["lr"]
@@ -687,7 +770,7 @@ def main():
         best_ckpt = torch.load(out_dir / "best_model.pt", map_location=device)
         model.load_state_dict(best_ckpt["model_state_dict"])
         final_kwargs = late_kwargs if args.schedule_epoch is not None else early_kwargs
-        extreme_stats = run_epoch(model, extreme_loader, stft, optimizer, device, train=False, **final_kwargs)
+        extreme_stats = run_epoch(model, extreme_loader, stft, optimizer, device, args.sample_rate, train=False, **final_kwargs)
         print(f"Extreme (robustness, -5dB floor) set loss, best checkpoint: {extreme_stats['total']:.4f}")
         best_ckpt["extreme_loss"] = extreme_stats["total"]
         torch.save(best_ckpt, out_dir / "best_model.pt")

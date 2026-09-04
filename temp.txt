@@ -41,3 +41,5 @@ python train.py \
   --schedule_epoch 38 \
   --supp_weight_late 0.7 --supp_under_weight_late 14.0 --supp_over_weight_late 0.8 \
   --out_dir checkpoints_v3
+
+python train.py --epochs 60 --lr 5e-4 --base_channels 24 --n_dpgrnn 3 --tra_bands 4 --train_end 350 --val_end 400 --supp_weight 0.5 --supp_under_weight 8.0 --supp_over_weight 1.0 --speech_gain_weight 0.5 --speech_gain_under_weight 3.0 --speech_gain_over_weight 0.5 --speech_gain_window_sec 0.5 --wav_l1_weight 0.4 --schedule_epoch 38 --supp_weight_late 0.7 --supp_under_weight_late 14.0 --supp_over_weight_late 0.8 --speech_gain_weight_late 0.8 --speech_gain_under_weight_late 5.0 --out_dir checkpoints_v11
