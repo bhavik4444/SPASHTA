@@ -1,21 +1,38 @@
 """
-Sound Mixer for Noisy-Speech Dataset Generation (v3)
+Sound Mixer for Noisy-Speech Dataset Generation (v4)
 -----------------------------------------------------
 Scans folders of clean speech, noise, and background files, and builds
-a dataset of mixed audio files in TWO phases:
+a dataset of mixed audio files in THREE phases:
 
   1. "normal" phase (NUM_NORMAL_SAMPLES files) -- clean speech stays clearly
-     audible; noise/bg are present but don't dominate.
-  2. "extreme" phase (NUM_EXTREME_SAMPLES files) -- noise/bg are deliberately
-     loud (can exceed speech loudness) and near-guaranteed present, for
-     training a model to be robust under harsh conditions.
+     audible; noise/bg are present but OPTIONAL and don't dominate. General
+     speech-enhancement coverage (including noise-free / bg-only samples).
+  2. "gunfire_pair" phase (NUM_GUNFIRE_PAIR_SAMPLES files) -- a noise file
+     (real gunfire/impulsive-noise recording) is REQUIRED on every single
+     sample, swept across a WIDE loudness/SNR range from "clearly present but
+     secondary to speech" through "as loud as or louder than speech". This is
+     the bulk category that guarantees the model actually TRAINS on speech+
+     gunfire overlap (not just gets tested on it -- see train.py split notes).
+  3. "extreme" phase (NUM_EXTREME_SAMPLES files) -- noise/bg are deliberately
+     loud (can exceed speech loudness) and forced present, kept as a fully
+     HELD-OUT robustness check (train.py never trains or tunes on these).
 
 Each sample can combine a DIFFERENT NUMBER of files from each folder -- e.g.
 one sample might mix 1 clean + 1 noise, another 1 clean + 2 noise + 2 bg.
 
-Certain bg files can be boosted to appear more often than others (see
-BG_FILE_BOOST) -- e.g. making "static.wav" show up ~4x as often as other
-background files, if that's a noise condition you want over-represented.
+Noise and bg files are placed at a RANDOM temporal offset each time they're
+used (see fit_length_random_start), instead of always starting at sample 0.
+This matters a lot with a small noise-file library: without it, every mix
+that reuses "gunshot_indoor.wav" would tile/crop it identically, so the model
+could learn to recognize one fixed repeating pattern rather than generalizing.
+With it, the same file lands at a different position relative to speech in
+every sample that draws it -- start-heavy, middle, end, fully overlapping --
+which both multiplies effective diversity from a small library and spreads
+overlap difficulty realistically across the clip.
+
+Certain bg or noise files can be boosted to appear more often than others (see
+BG_FILE_BOOST / NOISE_FILE_BOOST) -- e.g. making "static.wav" show up ~4x as
+often as other background files, if that's a condition you want over-represented.
 
 Folder structure expected (relative to this script):
 
@@ -33,6 +50,10 @@ Two mixing styles, chosen randomly per sample (see MODE_WEIGHTS):
 
 Usage:
     python sound_mixer.py
+
+At the end, this script prints the exact index ranges of each phase and a
+suggested `--train_end` / `--val_end` pair for train.py -- pass those through
+so the train/val split actually matches what got generated.
 """
 
 import os
@@ -55,13 +76,21 @@ TARGET_SR = 16000
 AUDIO_EXTS = (".wav", ".flac", ".mp3", ".ogg")
 
 NUM_NORMAL_SAMPLES = 150
-NUM_EXTREME_SAMPLES = 50
+NUM_GUNFIRE_PAIR_SAMPLES = 250   # NEW: large dedicated phase, noise REQUIRED every sample
+NUM_EXTREME_SAMPLES = 60
 RANDOM_SEED = 42
 
 # How many files to pull from each folder for a single sample (inclusive range).
 CLEAN_COUNT_RANGE = (1, 1)   # always exactly 1 clean speech file per sample
 NOISE_COUNT_RANGE = (0, 2)
 BG_COUNT_RANGE = (0, 2)
+
+# Gunfire-pair phase: noise is REQUIRED (lo=1, enforced via require_noise in
+# generate_batch) on every sample. bg is kept light/optional so the clean+
+# noise relationship stays the clear signal in most of these samples rather
+# than being muddied by extra sources.
+NOISE_COUNT_RANGE_GUNFIRE = (1, 2)
+BG_COUNT_RANGE_GUNFIRE = (0, 1)
 
 # Extreme phase forces noise to (almost) always be present, since the point
 # is robustness under harsh/loud interference.
@@ -82,6 +111,14 @@ CLEAN_WEIGHT_RANGE = (0.7, 1.0)
 NOISE_WEIGHT_RANGE = (0.2, 0.6)
 BG_WEIGHT_RANGE = (0.15, 0.5)
 
+# ---- Gunfire-pair phase weight ranges (ratio mode) -- deliberately WIDE,
+# spanning "gunfire clearly present but speech still on top" through "gunfire
+# as loud as or louder than speech". This is the range the model needs to see
+# a LOT of during actual training, not just at held-out eval time. ----
+CLEAN_WEIGHT_RANGE_GUNFIRE = (0.55, 1.0)
+NOISE_WEIGHT_RANGE_GUNFIRE = (0.25, 0.75)
+BG_WEIGHT_RANGE_GUNFIRE = (0.15, 0.45)
+
 # ---- Extreme-phase weight ranges (ratio mode) -- tuned so worst-case speech
 # suppression bottoms out around -5dB even when 2 noise + 2 bg files stack ----
 CLEAN_WEIGHT_RANGE_EXTREME = (0.6, 0.85)
@@ -92,6 +129,12 @@ BG_WEIGHT_RANGE_EXTREME = (0.3, 0.5)
 # 0 dB = noise as loud as speech; kept >= 0 so speech is never buried.
 NOISE_SNR_RANGE_DB = (0, 20)
 BG_SNR_RANGE_DB = (0, 20)
+
+# ---- Gunfire-pair phase SNR ranges (dB), "snr" mode -- wide sweep from -8dB
+# (gunfire louder than speech) up to +15dB (gunfire present but secondary).
+# Overlaps the extreme range at the harsh end on purpose. ----
+NOISE_SNR_RANGE_DB_GUNFIRE = (-8, 15)
+BG_SNR_RANGE_DB_GUNFIRE = (0, 15)
 
 # ---- Extreme-phase SNR ranges (dB) -- floor capped at -5dB so speech is
 # stressed but never buried too deep ----
@@ -153,6 +196,26 @@ def fit_length(signal, target_len):
     return np.tile(signal, reps)[:target_len]
 
 
+def fit_length_random_start(signal, target_len, rng):
+    """Like fit_length, but picks a RANDOM start offset each call instead of
+    always starting at sample 0 -- used for noise/bg so a small file library
+    gets reused with varied temporal alignment relative to the speech instead
+    of producing the exact same tiled/cropped pattern every time. If the
+    (possibly short) clip needs tiling to reach target_len, the tiled buffer
+    is padded with one extra loop before picking the offset so the window can
+    start anywhere, including mid-loop."""
+    if len(signal) == 0:
+        return np.zeros(target_len, dtype=np.float32)
+    if len(signal) <= target_len:
+        reps = int(np.ceil(target_len / len(signal))) + 1
+        buf = np.tile(signal, reps)
+    else:
+        buf = signal
+    max_start = len(buf) - target_len
+    start = rng.randint(0, max_start) if max_start > 0 else 0
+    return buf[start:start + target_len]
+
+
 def rms(signal):
     return np.sqrt(np.mean(signal ** 2) + 1e-12)
 
@@ -174,12 +237,28 @@ def normalize_peak(signal, peak=0.95):
 
 
 def load_group(cache, paths, target_len):
-    """Load each file in `paths`, fit to target_len, return list of arrays."""
+    """Load each file in `paths`, fit to target_len starting at sample 0,
+    return list of arrays. Used for clean speech, where target_len is
+    already derived from the clean file itself so no cropping/tiling bias
+    is introduced."""
     out = []
     for p in paths:
         if p not in cache:
             cache[p] = load_audio(p)
         out.append(fit_length(cache[p], target_len))
+    return out
+
+
+def load_group_random(cache, paths, target_len, rng):
+    """Like load_group, but each file is placed at a random temporal offset
+    (see fit_length_random_start). Used for noise/bg so gunfire and other
+    interference land at varied positions relative to speech across samples
+    that reuse the same source file."""
+    out = []
+    for p in paths:
+        if p not in cache:
+            cache[p] = load_audio(p)
+        out.append(fit_length_random_start(cache[p], target_len, rng))
     return out
 
 
@@ -241,7 +320,10 @@ def mix_ratio_group(clean_files, noise_files, bg_files, cache, target_len, rng, 
     weight_log = []  # list of (path, category, weight)
 
     for path, category in all_paths:
-        sig = load_group(cache, [path], target_len)[0]
+        if category == "clean":
+            sig = load_group(cache, [path], target_len)[0]
+        else:
+            sig = load_group_random(cache, [path], target_len, rng)[0]
         w = round(rng.uniform(*weight_ranges[category]), 3)
         mix += w * sig
         weight_log.append((path, category, w))
@@ -254,8 +336,8 @@ def mix_snr_group(clean_files, noise_files, bg_files, cache, target_len, rng, no
     """Composite-SNR mixing: sums each group into one reference/noise/bg signal,
     scales noise & bg groups to random target SNRs relative to the clean group."""
     clean_signals = load_group(cache, clean_files, target_len)
-    noise_signals = load_group(cache, noise_files, target_len)
-    bg_signals = load_group(cache, bg_files, target_len)
+    noise_signals = load_group_random(cache, noise_files, target_len, rng)
+    bg_signals = load_group_random(cache, bg_files, target_len, rng)
 
     clean_composite = np.sum(clean_signals, axis=0) if clean_signals else np.zeros(target_len, dtype=np.float32)
     noise_composite = np.sum(noise_signals, axis=0) if noise_signals else None
@@ -289,9 +371,16 @@ def mix_snr_group(clean_files, noise_files, bg_files, cache, target_len, rng, no
 
 def generate_batch(difficulty, count, start_index, pools, cache, rng, rows,
                     noise_count_range, bg_count_range, weight_ranges,
-                    noise_snr_range, bg_snr_range):
+                    noise_snr_range, bg_snr_range, require_noise=False):
     """Generate `count` mixed samples of the given difficulty, appending rows
-    to `rows` and files to disk. Returns the next available file index."""
+    to `rows` and files to disk. Returns the next available file index.
+
+    require_noise=True rejects any draw that didn't end up selecting a noise
+    (gunfire) file, on top of the generic REQUIRE_AT_LEAST_ONE_NOISE_OR_BG
+    check -- needed for phases whose whole point is guaranteed speech+noise
+    overlap, since noise_count_range alone only guarantees selection when the
+    noise/ folder is non-empty (an empty folder degrades to 0 silently
+    otherwise)."""
     clean_pool, noise_pool, bg_pool = pools
     modes = list(MODE_WEIGHTS.keys())
     mode_probs = list(MODE_WEIGHTS.values())
@@ -309,6 +398,8 @@ def generate_batch(difficulty, count, start_index, pools, cache, rng, rows,
         bg_sel = sample_subset(bg_pool, bg_count_range, rng, BG_FILE_BOOST)
 
         if not clean_sel:
+            continue
+        if require_noise and not noise_sel:
             continue
         if REQUIRE_AT_LEAST_ONE_NOISE_OR_BG and not noise_sel and not bg_sel:
             continue
@@ -379,24 +470,38 @@ def main():
     if not clean_pool:
         print(f"No clean speech files found in '{CLEAN_DIR}/'. Nothing to do.")
         return
+    if (NUM_GUNFIRE_PAIR_SAMPLES > 0 or NUM_EXTREME_SAMPLES > 0) and not noise_pool:
+        print(f"WARNING: '{NOISE_DIR}/' is empty, but the gunfire_pair and/or extreme phases "
+              f"require a real noise/gunfire file on every sample -- this script can't "
+              f"synthesize one, so those phases will generate 0 files. Add recordings to "
+              f"'{NOISE_DIR}/' first.")
 
     audio_cache = {}
     rows = []
     pools = (clean_pool, noise_pool, bg_pool)
 
     normal_weight_ranges = {"clean": CLEAN_WEIGHT_RANGE, "noise": NOISE_WEIGHT_RANGE, "bg": BG_WEIGHT_RANGE}
+    gunfire_weight_ranges = {"clean": CLEAN_WEIGHT_RANGE_GUNFIRE, "noise": NOISE_WEIGHT_RANGE_GUNFIRE, "bg": BG_WEIGHT_RANGE_GUNFIRE}
     extreme_weight_ranges = {"clean": CLEAN_WEIGHT_RANGE_EXTREME, "noise": NOISE_WEIGHT_RANGE_EXTREME, "bg": BG_WEIGHT_RANGE_EXTREME}
 
     next_idx = 1
     next_idx = generate_batch(
         "normal", NUM_NORMAL_SAMPLES, next_idx, pools, audio_cache, rng, rows,
         NOISE_COUNT_RANGE, BG_COUNT_RANGE, normal_weight_ranges,
-        NOISE_SNR_RANGE_DB, BG_SNR_RANGE_DB,
+        NOISE_SNR_RANGE_DB, BG_SNR_RANGE_DB, require_noise=False,
     )
+    gunfire_start = next_idx
+    next_idx = generate_batch(
+        "gunfire_pair", NUM_GUNFIRE_PAIR_SAMPLES, next_idx, pools, audio_cache, rng, rows,
+        NOISE_COUNT_RANGE_GUNFIRE, BG_COUNT_RANGE_GUNFIRE, gunfire_weight_ranges,
+        NOISE_SNR_RANGE_DB_GUNFIRE, BG_SNR_RANGE_DB_GUNFIRE, require_noise=True,
+    )
+    gunfire_end = next_idx - 1
+    extreme_start = next_idx
     next_idx = generate_batch(
         "extreme", NUM_EXTREME_SAMPLES, next_idx, pools, audio_cache, rng, rows,
         NOISE_COUNT_RANGE_EXTREME, BG_COUNT_RANGE_EXTREME, extreme_weight_ranges,
-        NOISE_SNR_RANGE_DB_EXTREME, BG_SNR_RANGE_DB_EXTREME,
+        NOISE_SNR_RANGE_DB_EXTREME, BG_SNR_RANGE_DB_EXTREME, require_noise=True,
     )
 
     fieldnames = ["filename", "difficulty", "mode", "num_clean", "num_noise", "num_bg",
@@ -411,6 +516,21 @@ def main():
     total = len(rows)
     print(f"\nDone. Generated {total} files in '{OUTPUT_DIR}/'")
     print(f"Log written to '{CSV_LOG_PATH}'")
+    print(f"\nPhase ranges:")
+    print(f"  normal:       1..{NUM_NORMAL_SAMPLES}")
+    print(f"  gunfire_pair: {gunfire_start}..{gunfire_end}  (noise required every sample)")
+    print(f"  extreme:      {extreme_start}..{total}  (held out -- never train/tune on these)")
+
+    # Suggested split for train.py: train on all of "normal" plus most of
+    # "gunfire_pair" (80%), validate on the remaining "gunfire_pair" tail so
+    # checkpoint selection itself rewards good speech+gunfire overlap
+    # behavior, and leave the whole "extreme" phase untouched as a pure
+    # held-out robustness check.
+    gunfire_train_count = int(round(NUM_GUNFIRE_PAIR_SAMPLES * 0.8))
+    suggested_train_end = NUM_NORMAL_SAMPLES + gunfire_train_count
+    suggested_val_end = gunfire_end
+    print(f"\nSuggested train.py flags to match this split:")
+    print(f"  --train_end {suggested_train_end} --val_end {suggested_val_end}")
 
 
 if __name__ == "__main__":

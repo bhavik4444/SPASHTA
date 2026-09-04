@@ -16,20 +16,40 @@ inside it):
       train.py, infer.py, model.py, main.py
       checkpoints/               (created automatically)
       sample_data/                <- this is --data_root, defaults to "sample_data"
-        mixed_dataset/   1.wav ... 200.wav      (already-mixed noisy audio)
+        mixed_dataset/   1.wav ... 460.wav      (already-mixed noisy audio)
         clean/           Clean clip1.wav, ...   (ground-truth clean speech)
         csvs/mix_log.csv                        (recipe for every mixed file)
         bg/, noise/, sound_mixer.py             (dataset team's mixing inputs/script)
 
-By default, files are split by their numeric filename:
-    1..100    -> training
-    101..150  -> validation (drives checkpoint selection + LR schedule)
-    151..200  -> held-out "extreme" set (-5dB floor), reported once at the
+sound_mixer.py (v4) generates THREE phases, in this order:
+    "normal"       -- noise/bg optional, general enhancement coverage
+    "gunfire_pair" -- noise (gunfire) REQUIRED on every sample, wide SNR sweep
+    "extreme"      -- noise forced + harsh (-5dB floor), held-out robustness only
+
+By default (matching sound_mixer.py's default counts: 150 / 250 / 60), files
+are split by their numeric filename:
+    1..350    -> training       (all 150 "normal" + 200 of the 250 "gunfire_pair")
+    351..400  -> validation     (remaining 50 "gunfire_pair" -- drives checkpoint
+                                  selection + LR schedule using overlap examples,
+                                  not just generic ones)
+    401..460  -> held-out "extreme" set (-5dB floor), reported once at the
                  very end as a robustness number -- never trained or tuned on
 
-That split matches the CSV's own "difficulty" column (normal = rows 1..150,
-extreme = rows 151..200), with the first 150 further cut 100/50 into
-train/val. Adjust --train_end / --val_end if you want a different split.
+IMPORTANT: unlike the previous version, "gunfire_pair" (guaranteed speech+
+gunfire overlap, swept across a wide loudness range) is now mostly INSIDE the
+train/val split, not held out. Previously the only guaranteed-noise-present
+phase ("extreme") was 100% held out, meaning the model never actually trained
+on an example where gunfire was certain to be present -- it only ever learned
+that pattern indirectly through the optional-noise "normal" phase. That's a
+likely contributor if suppression looked erratic or over-aggressive on real
+gunfire+speech clips: the model was validated on the same optional-noise
+distribution it trained on, so nothing during training rewarded getting the
+overlap case specifically right.
+
+sound_mixer.py prints the exact phase boundaries and a matching
+--train_end/--val_end suggestion after every run -- always re-check those if
+you change NUM_NORMAL_SAMPLES / NUM_GUNFIRE_PAIR_SAMPLES / NUM_EXTREME_SAMPLES,
+since the split below assumes the defaults.
 
 The clean target for each mixed file is loaded fresh from sample_data/clean/
 and RMS-normalized to --clean_target_rms (0.1 by default, matching
@@ -149,7 +169,9 @@ def load_csv_rows(csv_path):
 
 def split_rows(rows, train_end, val_end):
     """Files 1..train_end -> train, train_end+1..val_end -> validation,
-    everything after val_end -> held-out extreme/robustness set."""
+    everything after val_end -> held-out extreme/robustness set. Defaults
+    (350/400) match sound_mixer.py v4's default 150/250/60 phase counts --
+    re-check sound_mixer.py's printed suggestion if those counts change."""
     def idx(r):
         return int(Path(r["filename"]).stem)
     train_rows = [r for r in rows if idx(r) <= train_end]
@@ -353,6 +375,7 @@ def suppression_penalty(pred_spec, clean_spec, under_weight=2.5, over_weight=1.0
 def run_epoch(model, loader, stft, optimizer, device, train=True,
               spec_weight=1.0, wav_weight=1.0,
               wav_l1_weight=0.30, speech_gain_weight=0.35,
+              speech_gain_under_weight=2.0, speech_gain_over_weight=0.5,
               supp_weight=0.5, supp_under_weight=8.0, supp_over_weight=1.0):
     model.train(mode=train)
     totals = {
@@ -379,7 +402,9 @@ def run_epoch(model, loader, stft, optimizer, device, train=True,
             loss_spec = compressed_spectral_loss(pred_spec, clean_spec)
             loss_si_snr = si_snr_loss(pred_wav, clean_wav)
             loss_wav_l1 = wav_l1_loss(pred_wav, clean_wav)
-            loss_speech_gain = speech_gain_loss(pred_wav, clean_wav)
+            loss_speech_gain = speech_gain_loss(pred_wav, clean_wav,
+                                                 under_weight=speech_gain_under_weight,
+                                                 over_weight=speech_gain_over_weight)
             loss_supp = suppression_penalty(pred_spec, clean_spec,
                                              under_weight=supp_under_weight,
                                              over_weight=supp_over_weight)
@@ -418,11 +443,16 @@ def main():
                         "-- defaults to 'sample_data', matching the project layout")
     p.add_argument("--csv_name", type=str, default="csvs/mix_log.csv",
                    help="path to the mix log CSV, relative to --data_root")
-    p.add_argument("--train_end", type=int, default=100,
-                   help="files 1..train_end (by numeric filename) are used for training")
-    p.add_argument("--val_end", type=int, default=150,
+    p.add_argument("--train_end", type=int, default=350,
+                   help="files 1..train_end (by numeric filename) are used for training. "
+                        "Default (350) matches sound_mixer.py's default counts: all 150 "
+                        "'normal' + 200 of 250 'gunfire_pair'. If you change the NUM_* "
+                        "counts in sound_mixer.py, use the --train_end it prints instead.")
+    p.add_argument("--val_end", type=int, default=400,
                    help="files train_end+1..val_end are used for validation; "
-                        "everything after val_end becomes the held-out extreme set")
+                        "everything after val_end becomes the held-out extreme set. "
+                        "Default (400) matches sound_mixer.py's default counts: the "
+                        "remaining 50 'gunfire_pair' samples after --train_end.")
     p.add_argument("--clean_target_rms", type=float, default=0.1,
                    help="RMS loudness the clean target is normalized to -- match "
                         "sound_mixer.py's TARGET_INPUT_RMS")
@@ -442,6 +472,16 @@ def main():
                         "clean target amplitude")
     p.add_argument("--speech_gain_weight", type=float, default=0.35,
                    help="weight on speech amplitude/gain matching to the clean reference")
+    p.add_argument("--speech_gain_under_weight", type=float, default=2.0,
+                   help="inside speech_gain_loss: cost per unit of speech amplitude shortfall "
+                        "(alpha < 1, i.e. enhanced speech quieter than clean target). This is "
+                        "the most targeted knob for 'gunfire suppression is good but speech got "
+                        "quiet' -- raise it (e.g. 3-5) to push specifically on restoring ducked "
+                        "speech without touching how hard gunfire itself gets suppressed. Not "
+                        "scheduled by *_late (constant by design, same as speech_gain_weight).")
+    p.add_argument("--speech_gain_over_weight", type=float, default=0.5,
+                   help="inside speech_gain_loss: cost per unit of speech amplitude overshoot "
+                        "(alpha > 1, enhanced speech louder than clean target). Usually leave low.")
     p.add_argument("--supp_weight", type=float, default=0.5,
                    help="EARLY-PHASE weight on the asymmetric over-suppression penalty")
     p.add_argument("--supp_under_weight", type=float, default=8.0,
@@ -555,6 +595,8 @@ def main():
         wav_weight=args.wav_weight,
         wav_l1_weight=args.wav_l1_weight,
         speech_gain_weight=args.speech_gain_weight,
+        speech_gain_under_weight=args.speech_gain_under_weight,
+        speech_gain_over_weight=args.speech_gain_over_weight,
         supp_weight=args.supp_weight,
         supp_under_weight=args.supp_under_weight,
         supp_over_weight=args.supp_over_weight,
@@ -567,6 +609,8 @@ def main():
         wav_weight=args.wav_weight,        # not scheduled -- same both phases
         wav_l1_weight=args.wav_l1_weight_late if args.wav_l1_weight_late is not None else args.wav_l1_weight,
         speech_gain_weight=args.speech_gain_weight,  # constant by design
+        speech_gain_under_weight=args.speech_gain_under_weight,  # constant by design
+        speech_gain_over_weight=args.speech_gain_over_weight,    # constant by design
         supp_weight=args.supp_weight_late if args.supp_weight_late is not None else args.supp_weight,
         supp_under_weight=args.supp_under_weight_late if args.supp_under_weight_late is not None else args.supp_under_weight,
         supp_over_weight=args.supp_over_weight_late if args.supp_over_weight_late is not None else args.supp_over_weight,

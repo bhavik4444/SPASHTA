@@ -1,1 +1,43 @@
 python train.py --epochs 10 --lr 5e-5 --base_channels 24 --n_dpgrnn 3 --tra_bands 4 --supp_over_weight 1.0 --supp_under_weight 8.0 --supp_weight 0.5 --wav_l1_weight 0.30 --speech_loudness_weight 0.15 --out_dir checkpoints_v5_loudness --hop_length 256 --n_fft 512 --segment_seconds 4.0 --init_checkpoint checkpoints_v4_extreme/best_model.pt
+
+
+
+Changes to sound_mixer.py:
+
+New gunfire_pair phase (250 samples by default) — noise is required on every sample (enforced by a new require_noise check, not just probabilistic), swept across a wide range from "gunfire present but secondary" to "gunfire louder than speech." Total samples: 150 + 250 + 60 = 460, up from 200.
+Random temporal placement for noise/bg (fit_length_random_start) — previously, reusing a short noise file always tiled/cropped it identically from sample 0, so a small gunfire library produced repetitive, memorizable patterns. Now each reuse lands at a different offset — I verified this with a synthetic smoke test (two draws of the same file, same length, produced different audio).
+The script now prints the exact phase index ranges and a matching --train_end/--val_end suggestion after each run, so it stays correct even if you change the sample counts later.
+
+Changes to train.py: updated the docstring and default --train_end 350 / --val_end 400 to match — training now includes 200 of the 250 gunfire_pair samples, and validation (which drives checkpoint selection) uses the remaining 50, so the checkpoint you keep is explicitly the one that's best at the overlap case, not just generic enhancement.
+
+What to add to clean/ and noise/
+
+Clean speech — variety matters more than volume:
+
+Multiple speakers, both genders, a real spread of ages/voices
+Both calm/conversational and loud or urgent/shouted speech — real speech near gunfire tends to get louder and more stressed (Lombard effect), so training only on calm read speech creates a mismatch
+If your deployment involves a transmission channel (radio, phone line, comms handset), include some speech recorded/passed through that same channel — clean studio speech has different spectral characteristics than bandwidth-limited radio speech
+Some silence-only or non-speech-only clips so the model doesn't learn to hallucinate speech
+
+Noise (gunfire) — the gunfire_pair phase's realism depends entirely on this folder:
+
+Multiple weapon types/calibers (pistol vs. rifle vs. automatic burst) — very different transient shapes and frequency content
+Both isolated single shots and sustained automatic fire — the random-offset placement handles either well, but the model needs both patterns represented
+Multiple recording distances — near-field (sharp, high-frequency-rich) vs. far-field (muffled, reverberant)
+Both indoor/enclosed (echoey) and outdoor/open recordings
+If relevant to your use case, suppressed/muzzle-braked variants (quieter, different spectral shape)
+
+
+
+
+python train.py \
+  --epochs 60 \
+  --lr 5e-4 \
+  --base_channels 24 --n_dpgrnn 3 --tra_bands 4 \
+  --train_end 350 --val_end 400 \
+  --supp_weight 0.5 --supp_under_weight 8.0 --supp_over_weight 1.0 \
+  --speech_gain_weight 0.5 --speech_gain_under_weight 3.0 --speech_gain_over_weight 0.5 \
+  --wav_l1_weight 0.4 \
+  --schedule_epoch 38 \
+  --supp_weight_late 0.7 --supp_under_weight_late 14.0 --supp_over_weight_late 0.8 \
+  --out_dir checkpoints_v3
