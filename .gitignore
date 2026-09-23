@@ -30,6 +30,15 @@ pyproject.toml
 # Local training files
 train_commands
 
+# ESP-IDF generated files
+embedded/build/
+embedded/sdkconfig
+embedded/sdkconfig.old
+embedded/.idf.py/
+
+# Quantization host-test build
+quantization/host_test
+
 # ML checkpoints
 checkpoints*/
 *.pt
