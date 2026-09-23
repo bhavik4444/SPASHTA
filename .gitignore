@@ -22,6 +22,14 @@ Thumbs.db
 .env
 .env.*
 
+# Local-only uv/project files
+uv.lock
+pyproject.toml
+.python-version
+
+# Local training files
+train_commands
+
 # ML checkpoints
 checkpoints*/
 *.pt
