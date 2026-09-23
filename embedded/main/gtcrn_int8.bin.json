@@ -1,0 +1,32 @@
+{
+  "sample_rate": 16000,
+  "n_fft": 512,
+  "hop_length": 256,
+  "n_freqs": 257,
+  "erb_subband_1": 65,
+  "erb_subband_2": 64,
+  "width": 129,
+  "bn_width": 33,
+  "base_channels": 16,
+  "n_dpgrnn": 2,
+  "tra_bands": 8,
+  "n_dil": 3,
+  "dil": [
+    1,
+    2,
+    5
+  ],
+  "df_order": 3,
+  "df_bins": 48,
+  "n_out": 9,
+  "mask_max": 2.0,
+  "mask_min": 0.0,
+  "compress": 0.3,
+  "level_frames": 192,
+  "smooth_frames": 4,
+  "nf_frames": 96,
+  "nf_bias": 1.6,
+  "snr_lo": -1.0,
+  "snr_hi": 2.5,
+  "mix_rms": 0.1
+}

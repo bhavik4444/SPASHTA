@@ -1,0 +1,19 @@
+idf_component_register(
+    SRCS
+        "gtcrn_ops.c"
+        "gtcrn_net.c"
+        "gt_dot_i8_s3.S"
+    INCLUDE_DIRS
+        "include"
+    PRIV_INCLUDE_DIRS
+        "."
+    REQUIRES
+        esp_timer
+)
+target_compile_options(
+    ${COMPONENT_LIB}
+    PRIVATE
+        -O3
+        -funroll-loops
+        -Wno-error=format-truncation
+)

@@ -1,0 +1,42 @@
+# ---- target ----------------------------------------------------------------
+CONFIG_IDF_TARGET="esp32s3"
+
+# ---- flash: 16 MB, custom table --------------------------------------------
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
+CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# ---- PSRAM: 8 MB octal -----------------------------------------------------
+# If your module has QUAD PSRAM (many N8R2 / N8R8 boards do), replace
+# SPIRAM_MODE_OCT with CONFIG_SPIRAM_MODE_QUAD=y or the board will not boot.
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_TYPE_AUTO=y
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_SPIRAM_USE_MALLOC=y
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096
+CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
+
+# ---- clock and scheduler ---------------------------------------------------
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+CONFIG_FREERTOS_HZ=1000
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=16384
+
+# ---- build for speed -------------------------------------------------------
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+CONFIG_COMPILER_OPTIMIZATION_ASSERTIONS_SILENT=y
+CONFIG_NEWLIB_NANO_FORMAT=n
+
+# ---- radios off: nothing here needs them, and they cost RAM and cycles -----
+CONFIG_ESP_WIFI_ENABLED=y
+CONFIG_BT_ENABLED=n
+
+# ---- FAT / SD --------------------------------------------------------------
+CONFIG_FATFS_LFN_HEAP=y
+CONFIG_FATFS_MAX_LFN=255
+
+# ---- watchdogs: enhancement runs long and hogs a core ----------------------
+CONFIG_ESP_TASK_WDT_TIMEOUT_S=30
+CONFIG_ESP_INT_WDT_TIMEOUT_MS=1000
