@@ -41,7 +41,7 @@ quantization/host_test
 
 # ML checkpoints
 checkpoints*/
-*.pt
+
 *.pth
 *.ckpt
 runs/
