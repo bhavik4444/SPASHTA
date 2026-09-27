@@ -1,1 +1,1 @@
-spashta
+SPASHTA
