@@ -1,0 +1,2 @@
+python infer.py --checkpoint trained_models/model_high/best_model.pt --input examples/normal/noisy.wav --output examples/normal/cleaned.wav
+python infer.py --checkpoint trained_models/model_high/best_model.pt --input examples/extreme/noisy.wav --output examples/extreme/cleaned.wav
